@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: emotion-stress-detector
+    runtime: docker
+    plan: standard
+    healthCheckPath: /
+    autoDeploy: true

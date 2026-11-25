@@ -1,7 +1,7 @@
+streamlit
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1+cpu
+torch
 numpy<2
-opencv-python-headless==4.10.0.84
-transformers==4.44.2
-gradio==4.44.1
+opencv-python-headless
+transformers
 pillow

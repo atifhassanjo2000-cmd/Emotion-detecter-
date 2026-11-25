@@ -1,15 +1,20 @@
-"""Emotion & stress detector - Gradio web app (Render-ready)."""
+"""Emotion & stress detector - Streamlit app (Streamlit Community Cloud ready)."""
+
 import os
+
 import cv2
 import numpy as np
+import streamlit as st
 import torch
 import torch.nn as nn
-import gradio as gr
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
+st.set_page_config(page_title="Emotion & Stress Detector", page_icon="🙂")
+
 torch.set_num_threads(2)
 device = torch.device("cpu")
+
 EMO = ["Neutral", "Happy", "Sad", "Angry", "Fear"]
 STR = ["Low Stress", "Moderate", "High Stress"]
 WEIGHTS = os.environ.get("WEIGHTS_PATH", "multimodal_emotion_stress_pro.pth")
@@ -23,40 +28,47 @@ class MultimodalEmotionStressNet(nn.Module):
             nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
             nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(), nn.Linear(512, 64), nn.BatchNorm1d(64), nn.ReLU())
-        self.audio_net = nn.Sequential(nn.Linear(52, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.2), nn.Linear(64, 64), nn.ReLU())
-        self.physio_net = nn.Sequential(nn.Linear(16, 32), nn.BatchNorm1d(32), nn.ReLU(), nn.Linear(32, 64), nn.ReLU())
+        self.audio_net = nn.Sequential(
+            nn.Linear(52, 64), nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 64), nn.ReLU())
+        self.physio_net = nn.Sequential(
+            nn.Linear(16, 32), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.Linear(32, 64), nn.ReLU())
         self.attention = nn.Sequential(nn.Linear(192, 192), nn.Sigmoid())
         self.shared_fc = nn.Sequential(nn.Linear(192, 128), nn.ReLU(), nn.Dropout(0.3))
         self.emotion_head = nn.Linear(128, num_emotions)
         self.stress_head = nn.Linear(128, num_stress)
 
     def forward(self, vis, aud, phy):
-        fused = torch.cat([self.visual_net(vis), self.audio_net(aud), self.physio_net(phy)], dim=1)
+        fused = torch.cat(
+            [self.visual_net(vis), self.audio_net(aud), self.physio_net(phy)], dim=1)
         attn = self.attention(fused)
         shared = self.shared_fc(fused * attn)
         return self.emotion_head(shared), self.stress_head(shared), attn
 
 
-# ---- load models once at startup ----
-net = None
-if os.path.exists(WEIGHTS):
-    try:
-        net = MultimodalEmotionStressNet().to(device)
-        net.load_state_dict(torch.load(WEIGHTS, map_location=device))
-        net.eval()
-        print("Loaded custom weights:", WEIGHTS)
-    except Exception as e:
-        print("Custom weights failed to load, using HF model only:", e)
-        net = None
-else:
-    print("No custom weights found, using HF model only.")
+# ---- load models once (cached across reruns) ----
+@st.cache_resource(show_spinner="Loading models...")
+def load_models():
+    net = None
+    if os.path.exists(WEIGHTS):
+        try:
+            net = MultimodalEmotionStressNet().to(device)
+            net.load_state_dict(torch.load(WEIGHTS, map_location=device))
+            net.eval()
+        except Exception as e:
+            print("Custom weights failed to load, using HF model only:", e)
+            net = None
 
-hf_proc = AutoImageProcessor.from_pretrained(HF_NAME)
-hf_net = AutoModelForImageClassification.from_pretrained(HF_NAME).to(device).eval()
-hf_labels = {int(k): str(v).lower() for k, v in hf_net.config.id2label.items()}
+    hf_proc = AutoImageProcessor.from_pretrained(HF_NAME)
+    hf_net = AutoModelForImageClassification.from_pretrained(HF_NAME).to(device).eval()
+    hf_labels = {int(k): str(v).lower() for k, v in hf_net.config.id2label.items()}
+    face_cascade = cv2.CascadeClassifier(
+        os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
+    return net, hf_proc, hf_net, hf_labels, face_cascade
 
-face_cascade = cv2.CascadeClassifier(
-    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
+
+net, hf_proc, hf_net, hf_labels, face_cascade = load_models()
 
 
 def hf_emotion(rgb_roi):
@@ -66,20 +78,27 @@ def hf_emotion(rgb_roi):
     out = np.zeros(5, dtype=np.float32)
     for i, p in enumerate(probs):
         l = hf_labels.get(i, "")
-        if "neutral" in l: out[0] += p
-        elif "happy" in l: out[1] += p
-        elif "sad" in l: out[2] += p
-        elif "angry" in l or "anger" in l: out[3] += p
-        elif "fear" in l: out[4] += p
-        elif "surprise" in l: out[4] += 0.5 * p; out[1] += 0.3 * p
-        elif "disgust" in l: out[3] += 0.6 * p; out[2] += 0.4 * p
+        if "neutral" in l:
+            out[0] += p
+        elif "happy" in l:
+            out[1] += p
+        elif "sad" in l:
+            out[2] += p
+        elif "angry" in l or "anger" in l:
+            out[3] += p
+        elif "fear" in l:
+            out[4] += p
+        elif "surprise" in l:
+            out[4] += 0.5 * p
+            out[1] += 0.3 * p
+        elif "disgust" in l:
+            out[3] += 0.6 * p
+            out[2] += 0.4 * p
     s = out.sum()
     return out / s if s > 1e-6 else np.full(5, 0.2, dtype=np.float32)
 
 
 def predict(rgb):
-    if rgb is None:
-        return None, {}, {}
     h, w, _ = rgb.shape
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     faces = face_cascade.detectMultiScale(gray, 1.12, 4, minSize=(45, 45))
@@ -90,10 +109,11 @@ def predict(rgb):
         s = min(h, w) // 2
         x, y, bw, bh = (w - s) // 2, (h - s) // 2, s, s
         found = False
-    roi = rgb[y:y + bh, x:x + bw]
 
+    roi = rgb[y:y + bh, x:x + bw]
     ep = hf_emotion(roi)
     sp = None
+
     if net is not None:
         v = cv2.resize(roi, (64, 64)).transpose(2, 0, 1).astype(np.float32) / 255.0
         v = (v - v.mean(axis=(1, 2), keepdims=True)) / (v.std(axis=(1, 2), keepdims=True) + 1e-6)
@@ -113,24 +133,41 @@ def predict(rgb):
     out = rgb.copy()
     col = (0, 255, 0) if found else (255, 215, 0)
     cv2.rectangle(out, (x, y), (x + bw, y + bh), col, 2)
-    cv2.putText(out, f"{EMO[int(ep.argmax())]} ({ep.max() * 100:.0f}%)", (x, max(20, y - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
-    return out, {k: float(v) for k, v in zip(EMO, ep)}, {k: float(v) for k, v in zip(STR, sp)}
+    cv2.putText(out, f"{EMO[int(ep.argmax())]} ({ep.max() * 100:.0f}%)",
+                (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+
+    return (out,
+            {k: float(v) for k, v in zip(EMO, ep)},
+            {k: float(v) for k, v in zip(STR, sp)},
+            found)
 
 
-with gr.Blocks(title="Emotion & Stress Detector") as demo:
-    gr.Markdown("# Emotion & Stress Detector\nAllow camera access. Stress is an **estimate** "
-                "inferred from facial emotion, not a clinical measurement. Frames are processed in memory and not saved.")
-    with gr.Row():
-        cam = gr.Image(sources=["webcam"], streaming=True, type="numpy", label="Camera")
-        ann = gr.Image(label="Detection", type="numpy")
-    with gr.Row():
-        emo = gr.Label(label="Emotion", num_top_classes=5)
-        stress = gr.Label(label="Stress (estimate)", num_top_classes=3)
-    cam.stream(predict, inputs=cam, outputs=[ann, emo, stress],
-               stream_every=1.0, concurrency_limit=2)
+# ---- UI ----
+st.title("Emotion & Stress Detector")
+st.caption(
+    "Allow camera access and take a photo. Stress is an **estimate** inferred from "
+    "facial emotion, not a clinical measurement. Images are processed in memory and not saved."
+)
 
-demo.queue(max_size=10)
+shot = st.camera_input("Take a photo")
 
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 10000)))
+if shot is not None:
+    rgb = np.array(Image.open(shot).convert("RGB"))
+    with st.spinner("Analyzing..."):
+        annotated, emo, stress, found = predict(rgb)
+
+    if not found:
+        st.warning("No face detected, so the center of the image was analyzed instead.")
+
+    st.image(annotated, caption="Detection", use_container_width=True)
+
+    top_emo = max(emo, key=emo.get)
+    top_stress = max(stress, key=stress.get)
+    c1, c2 = st.columns(2)
+    c1.metric("Emotion", top_emo, f"{emo[top_emo] * 100:.0f}%", delta_color="off")
+    c2.metric("Stress (estimate)", top_stress, f"{stress[top_stress] * 100:.0f}%", delta_color="off")
+
+    st.subheader("Emotion probabilities")
+    st.bar_chart(emo)
+    st.subheader("Stress probabilities")
+    st.bar_chart(stress)
